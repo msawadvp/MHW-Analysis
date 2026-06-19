@@ -1,0 +1,489 @@
+"""
+Arabian Sea MARINE HEATWAVE ANALYSIS
+
+
+DATA:
+    OISST Daily SST (1993–2025)
+
+METHOD:
+    Hobday et al. (2016)
+
+METRICS:
+    1. Frequency (events/year)
+    2. Duration (days/event)
+    3. Total MHW Days (days/year)
+    4. Cumulative Intensity (°C·days/year)
+
+
+"""
+
+# IMPORTS
+
+
+from netCDF4 import Dataset, num2date
+import numpy as np
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from scipy.ndimage import gaussian_filter
+import marineHeatWaves as mhw
+import os
+import warnings
+from datetime import date
+warnings.filterwarnings("ignore")
+
+# CONFIGURATION
+
+class Config:
+
+    # INPUT FILE
+    OISST_FILE = "Output file name"
+
+    # OUTPUT
+    OUTPUT_DIR = "Result Direction"
+
+    # BAY OF BENGAL DOMAIN_Change for Other Regions
+    LAT_MIN = 5
+    LAT_MAX = 27
+
+    LON_MIN = 45
+    LON_MAX = 80
+
+    # CLIMATOLOGY PERIOD
+    CLIM_START = 1993
+    CLIM_END = 2022
+
+    # ANALYSIS PERIOD
+    ANALYSIS_START = 1993
+    ANALYSIS_END = 2025
+
+    # HOBDAY PARAMETERS
+    PCTILE = 90
+    MIN_DURATION = 5
+    WINDOW_HALF_WIDTH = 5
+    SMOOTH_WIDTH = 31
+    MAX_GAP = 2
+
+    # PLOTTING
+    GAUSSIAN_SIGMA = 1
+
+
+config = Config()
+
+# CREATE OUTPUT DIRECTORY
+os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+
+
+# LOAD DATA
+
+
+
+print("LOADING DATA")
+
+
+data = Dataset(config.OISST_FILE)
+
+# CHECK DIMENSIONS
+print("\nSST Dimensions:")
+print(data.variables['sst'].dimensions)
+
+# LOAD SST
+sst = np.ma.filled(
+    data.variables['sst'][:],
+    np.nan
+)
+
+# COORDINATES
+lat = data.variables['lat'][:]
+lon = data.variables['lon'][:]
+
+# TIME
+time_var = data.variables['time']
+
+dates = num2date(
+    time_var[:],
+    units=time_var.units
+)
+
+# CONVERT TIME TO ORDINAL FLOAT
+
+
+t = np.array([
+    date(d.year, d.month, d.day).toordinal()
+    for d in dates
+])
+
+data.close()
+
+print("\nSST Shape:", sst.shape)
+
+print("SST Range:")
+print(np.nanmin(sst), np.nanmax(sst))
+
+
+# SUBSET BAY OF BENGAL
+
+
+
+print("SUBSETTING Arabian Sea")
+
+
+lat_idx = np.where(
+    (lat >= config.LAT_MIN) &
+    (lat <= config.LAT_MAX)
+)[0]
+
+lon_idx = np.where(
+    (lon >= config.LON_MIN) &
+    (lon <= config.LON_MAX)
+)[0]
+
+subset_lat = lat[lat_idx]
+subset_lon = lon[lon_idx]
+
+# IMPORTANT:
+
+
+sst_bob = sst[:, lat_idx, :][:, :, lon_idx]
+
+print("Subset Shape:", sst_bob.shape)
+
+# INITIALIZE METRIC ARRAYS
+
+
+nlat = len(subset_lat)
+nlon = len(subset_lon)
+
+mhw_frequency = np.full((nlat, nlon), np.nan)
+mhw_duration = np.full((nlat, nlon), np.nan)
+mhw_days = np.full((nlat, nlon), np.nan)
+mhw_cumint = np.full((nlat, nlon), np.nan)
+
+analysis_years = (
+    config.ANALYSIS_END -
+    config.ANALYSIS_START + 1
+)
+
+
+# TEST SINGLE GRID POINT
+
+
+print("TESTING SINGLE GRID POINT")
+
+
+test_ts = sst_bob[:, 30, 30]
+
+print("Test SST Range:")
+print(np.nanmin(test_ts), np.nanmax(test_ts))
+
+mhws_test, clim_test = mhw.detect(
+    t,
+    test_ts,
+    climatologyPeriod=[
+        config.CLIM_START,
+        config.CLIM_END
+    ]
+)
+
+print("Detected Events:", mhws_test['n_events'])
+
+
+# GRID-WISE MHW DETECTION
+
+
+print("GRID-WISE MHW DETECTION")
+
+
+valid_cells = 0
+
+for i in range(nlat):
+
+    for j in range(nlon):
+
+        sst_ts = sst_bob[:, i, j]
+
+        # SKIP LAND
+        if np.all(np.isnan(sst_ts)):
+            continue
+
+        try:
+
+            mhws, clim = mhw.detect(
+
+                t,
+                sst_ts,
+
+                climatologyPeriod=[
+                    config.CLIM_START,
+                    config.CLIM_END
+                ],
+
+                pctile=config.PCTILE,
+
+                minDuration=config.MIN_DURATION,
+
+                windowHalfWidth=config.WINDOW_HALF_WIDTH,
+
+                smoothPercentile=True,
+
+                smoothPercentileWidth=config.SMOOTH_WIDTH,
+
+                joinAcrossGaps=True,
+
+                maxGap=config.MAX_GAP
+            )
+
+            n_events = mhws['n_events']
+
+            if n_events > 0:
+
+                valid_cells += 1
+
+                # FREQUENCY
+                mhw_frequency[i, j] = (
+                    n_events / analysis_years
+                )
+
+                # DURATION
+                mhw_duration[i, j] = np.mean(
+                    mhws['duration']
+                )
+
+                # TOTAL DAYS
+                mhw_days[i, j] = (
+                    np.sum(mhws['duration']) /
+                    analysis_years
+                )
+
+                # CUMULATIVE INTENSITY
+                mhw_cumint[i, j] = (
+                    np.sum(
+                        mhws['intensity_cumulative']
+                    ) / analysis_years
+                )
+
+        except Exception:
+            continue
+
+print("\nValid Cells:", valid_cells)
+
+# CHECK METRICS
+
+
+print("CHECKING METRICS")
+
+
+print("Frequency:",
+      np.nanmin(mhw_frequency),
+      np.nanmax(mhw_frequency))
+
+print("Duration:",
+      np.nanmin(mhw_duration),
+      np.nanmax(mhw_duration))
+
+print("Total Days:",
+      np.nanmin(mhw_days),
+      np.nanmax(mhw_days))
+
+print("Cum Intensity:",
+      np.nanmin(mhw_cumint),
+      np.nanmax(mhw_cumint))
+
+
+# MASKED SMOOTHING
+
+
+def smooth_with_mask(data, sigma=1):
+
+    mask = np.isnan(data)
+
+    filled = np.where(mask, 0, data)
+
+    smooth_data = gaussian_filter(
+        filled,
+        sigma=sigma
+    )
+
+    smooth_mask = gaussian_filter(
+        (~mask).astype(float),
+        sigma=sigma
+    )
+
+    result = np.where(
+        smooth_mask > 1e-6,
+        smooth_data / smooth_mask,
+        np.nan
+    )
+
+    result[mask] = np.nan
+
+    return result
+
+
+smooth_freq = smooth_with_mask(
+    mhw_frequency,
+    sigma=config.GAUSSIAN_SIGMA
+)
+
+smooth_dur = smooth_with_mask(
+    mhw_duration,
+    sigma=config.GAUSSIAN_SIGMA
+)
+
+smooth_days = smooth_with_mask(
+    mhw_days,
+    sigma=config.GAUSSIAN_SIGMA
+)
+
+smooth_cumint = smooth_with_mask(
+    mhw_cumint,
+    sigma=config.GAUSSIAN_SIGMA
+)
+
+
+# PLOTTING
+
+
+
+print("PLOTTING.......")
+
+
+fig, axes = plt.subplots(
+    2,
+    2,
+    figsize=(14, 10),
+    subplot_kw={
+        'projection': ccrs.PlateCarree()
+    }
+)
+
+axes = axes.flatten()
+
+metrics = [
+
+    (
+        smooth_freq,
+        '(a) Frequency',
+        'events/year'
+    ),
+
+    (
+        smooth_dur,
+        '(b) Duration',
+        'days/event'
+    ),
+
+    (
+        smooth_days,
+        '(c) Total Days',
+        'days/year'
+    ),
+
+    (
+        smooth_cumint,
+        '(d) Cumulative Intensity',
+        '°C·days/year'
+    )
+]
+
+for ax, (data_arr, title, label) in zip(
+    axes,
+    metrics
+):
+
+    # SKIP EMPTY ARRAYS
+    if np.all(np.isnan(data_arr)):
+
+        print(f"Skipping {title}")
+        continue
+
+    valid = data_arr[~np.isnan(data_arr)]
+
+    vmin = np.nanpercentile(valid, 5)
+    vmax = np.nanpercentile(valid, 95)
+
+    levels = np.linspace(vmin, vmax, 30)
+
+    cf = ax.contourf(
+        subset_lon,
+        subset_lat,
+        data_arr,
+
+        levels=levels,
+
+        cmap='YlOrBr',
+
+        extend='both',
+
+        transform=ccrs.PlateCarree()
+    )
+
+    ax.set_extent([
+        config.LON_MIN,
+        config.LON_MAX,
+        config.LAT_MIN,
+        config.LAT_MAX
+    ])
+
+    ax.add_feature(
+        cfeature.COASTLINE,
+        linewidth=0.8
+    )
+
+    ax.add_feature(
+        cfeature.LAND,
+        color='lightgray'
+    )
+
+    gl = ax.gridlines(
+        draw_labels=True,
+        linewidth=0.5,
+        alpha=0.5,
+        linestyle='--'
+    )
+
+    gl.top_labels = False
+    gl.right_labels = False
+
+    ax.set_title(
+        title,
+        fontsize=12,
+        fontweight='bold'
+    )
+
+    cbar = fig.colorbar(
+        cf,
+        ax=ax,
+        shrink=0.8
+    )
+
+    cbar.set_label(label)
+
+plt.suptitle(
+    'Arabian Sea Marine Heatwave Metrics (1993–2025)',
+    fontsize=16,
+    fontweight='bold'
+)
+
+plt.tight_layout()
+
+# SAVE FIGURE
+outfile = os.path.join(
+    config.OUTPUT_DIR,
+    "AS_MHW_Metrics.png"
+)
+
+plt.savefig(
+    outfile,
+    dpi=300,
+    bbox_inches='tight'
+)
+
+print("Saved Figure:")
+print(outfile)
+
+plt.show()
+
+
+print("ANALYSIS COMPLETE")
+
