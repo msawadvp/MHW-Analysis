@@ -1,0 +1,464 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from netCDF4 import Dataset, num2date
+from datetime import datetime
+from scipy.ndimage import gaussian_filter
+import marineHeatWaves as mhw
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==================================================
+# USER SETTINGS
+# ==================================================
+nc_file = "/home/sriram/Internship/Data/BoB/OISST/OISST_BoB_1993_2025.nc"
+basin_name = "Bay of Bengal"
+
+# ==================================================
+# LOAD DATA
+# ==================================================
+print("Loading OISST...")
+ds = Dataset(nc_file)
+sst = ds.variables["sst"][:]
+lat = ds.variables["lat"][:]
+lon = ds.variables["lon"][:]
+time_var = ds.variables["time"]
+dates = num2date(time_var[:], units=time_var.units, calendar="standard")
+ds.close()
+
+# Mask unrealistic values
+sst = np.where((sst < -10) | (sst > 40), np.nan, sst)
+
+# Convert time to ordinal
+t = np.array([datetime(d.year, d.month, d.day).toordinal() for d in dates])
+
+nlat, nlon = len(lat), len(lon)
+
+# ==================================================
+# SEASONS DEFINITION
+# ==================================================
+seasons = {
+    "Winter": [12, 1, 2],
+    "Pre-Monsoon": [3, 4, 5],
+    "Summer-Monsoon": [6, 7, 8, 9],
+    "Post-Monsoon": [10, 11]
+}
+
+# ==================================================
+# STORAGE
+# ==================================================
+metrics = {}
+for season in seasons:
+    metrics[season] = {
+        "Frequency": np.full((nlat, nlon), np.nan),
+        "Duration": np.full((nlat, nlon), np.nan),
+        "MeanIntensity": np.full((nlat, nlon), np.nan)
+    }
+
+# ==================================================
+# MAIN LOOP: MHW DETECTION & SEASONAL METRICS
+# ==================================================
+print("Running MHW detection...")
+for i in range(nlat):
+    for j in range(nlon):
+        ts = sst[:, i, j]
+        if np.all(np.isnan(ts)):
+            continue
+           
+        try:
+            mhws, clim = mhw.detect(t, ts, climatologyPeriod=[1993, 2022])
+        except Exception:
+            continue
+           
+        if mhws["n_events"] == 0:
+            continue
+           
+        start_dates = mhws["date_peak"]
+        event_months = np.array([d.month for d in start_dates])
+        event_years = np.array([d.year for d in start_dates])
+        durations = np.array(mhws["duration"])
+        mean_intensity = np.array(mhws["intensity_mean"])
+       
+        # Handle Winter year shift (Dec belongs to next year's winter)
+        winter_years = event_years.copy()
+        winter_years[event_months == 12] += 1
+       
+        # Extend years array to capture Winter 2026 (from Dec 2025 events)
+        years_all = np.arange(1993, 2026)
+       
+        for season, months in seasons.items():
+            freq_yearly = []
+            dur_yearly = []
+            intensity_yearly = []
+           
+            for yr in years_all:
+                if season == "Winter":
+                    idx = np.isin(event_months, months) & (winter_years == yr)
+                else:
+                    idx = np.isin(event_months, months) & (event_years == yr)
+                   
+                nevents = np.sum(idx)
+                freq_yearly.append(nevents)
+               
+                if nevents > 0:
+                    dur_yearly.append(np.sum(durations[idx]))
+                    intensity_yearly.append(np.mean(mean_intensity[idx]))
+                else:
+                    dur_yearly.append(0)
+                    intensity_yearly.append(np.nan)
+                   
+            metrics[season]["Frequency"][i, j] = np.mean(freq_yearly)
+            metrics[season]["Duration"][i, j] = np.mean(dur_yearly)
+            metrics[season]["MeanIntensity"][i, j] = np.nanmean(intensity_yearly)
+           
+    if (i + 1) % 10 == 0:
+        print(f"  {i + 1}/{nlat} lats completed")
+       
+print("Detection and calculation finished.")
+
+# ==================================================
+# SAVE METRICS
+# ==================================================
+outfile = basin_name.replace(" ", "_") + "_Seasonal_MHW.npz"
+save_dict = {"lat": lat, "lon": lon}
+for season in seasons:
+    save_dict[f"{season}_Frequency"] = metrics[season]["Frequency"]
+    save_dict[f"{season}_Duration"] = metrics[season]["Duration"]
+    save_dict[f"{season}_MeanIntensity"] = metrics[season]["MeanIntensity"]
+   
+np.savez_compressed(outfile, **save_dict)
+print(f"Metrics saved to {outfile}")
+
+# ==================================================
+# COLOR LIMITS (Global across all seasons)
+# ==================================================
+vlims = {}
+for metric in ["Frequency", "Duration", "MeanIntensity"]:
+    vals = []
+    for season in seasons:
+        valid_data = metrics[season][metric][~np.isnan(metrics[season][metric])]
+        if len(valid_data) > 0:
+            vals.extend(valid_data)
+    vals = np.array(vals)
+    vlims[metric] = (np.percentile(vals, 2), np.percentile(vals, 98))
+
+# ==================================================
+# PLOTTING
+# ==================================================
+def smooth_with_mask(data, sigma=0.8):
+    """Normalized Gaussian smoothing to prevent land-bleeding"""
+    mask = np.isnan(data)
+    filled = np.where(mask, 0, data)
+    smooth_data = gaussian_filter(filled, sigma=sigma)
+    smooth_mask = gaussian_filter((~mask).astype(float), sigma=sigma)
+    result = np.where(smooth_mask > 1e-6, smooth_data / smooth_mask, np.nan)
+    result[mask] = np.nan
+    return result
+
+plt.rcParams.update({
+    "font.size": 11,
+    "axes.titlesize": 12,
+    "axes.labelsize": 11,
+    "figure.titlesize": 18
+})
+
+fig, axes = plt.subplots(3, 4, figsize=(18, 10), subplot_kw={"projection": ccrs.PlateCarree()})
+
+metric_names = ["Frequency", "Duration", "MeanIntensity"]
+season_names = list(seasons.keys())
+letters = [f"({chr(97+i)})" for i in range(12)]
+count = 0
+
+for r, metric in enumerate(metric_names):
+    vmin, vmax = vlims[metric]
+    for c, season in enumerate(season_names):
+        ax = axes[r, c]
+        data = metrics[season][metric]
+       
+        # Apply masked smoothing
+        smooth = smooth_with_mask(data, sigma=0.8)
+       
+        im = ax.contourf(lon, lat, smooth, levels=20, cmap="YlOrRd",
+                         vmin=vmin, vmax=vmax, extend="both",
+                         transform=ccrs.PlateCarree())
+                         
+        ax.add_feature(cfeature.LAND, facecolor="lightgray")
+        ax.coastlines(resolution="10m", linewidth=0.4)
+        gl=ax.gridlines(
+            draw_labels=True,
+            linewidth=0.3,
+            alpha=0.4
+        )
+        gl.top_labels=False
+        gl.right_labels=False
+        ax.set_extent([lon.min(), lon.max(), lat.min(), lat.max()])
+        ax.set_title(season, fontweight='bold')
+       
+        ax.text(0.03, 0.95, letters[count], transform=ax.transAxes,
+                fontweight="bold", va="top", fontsize=12)
+        count += 1
+       
+    # Add colorbar for the row
+    cax = fig.add_axes([0.92, 0.70 - r * 0.31, 0.015, 0.18])
+    cb = fig.colorbar(im, cax=cax)
+    if metric == "Frequency":
+        cb.set_label("Events/Season")
+    elif metric == "Duration":
+        cb.set_label("Days/Season")
+    else:
+        cb.set_label("°C")
+
+# Row labels
+fig.text(0.02, 0.82, "Frequency", rotation=90, fontweight="bold", fontsize=13, va='center')
+fig.text(0.02, 0.50, "Duration", rotation=90, fontweight="bold", fontsize=13, va='center')
+fig.text(0.02, 0.18, "Mean Intensity", rotation=90, fontweight="bold", fontsize=13, va='center')
+
+plt.suptitle(f"Seasonal Marine Heatwave Characteristics (1993–2025)\n{basin_name}",
+             fontweight="bold", y=1.02)
+             
+plt.tight_layout(rect=[0.04, 0, 0.9, 0.95])
+
+outfig = basin_name.replace(" ", "_") + "_Seasonal_MHW.png"
+plt.savefig(outfig, dpi=300, bbox_inches="tight")
+print(f"Figure saved to {outfig}")
+plt.show()
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ======================================================
+# PATHS
+# ======================================================
+
+AS = "/home/sriram/Internship/Arabian_Sea_Decadal_MHW_Metrics"
+BoB = "/home/sriram/Internship/Bay_of_Bengal_Decadal_MHW_Metrics"
+
+# ======================================================
+# HELPER FUNCTION
+# ======================================================
+
+def basin_mean(file):
+    return np.nanmean(np.load(file))
+
+def pct_change(old, new):
+    return ((new - old) / old) * 100
+
+# ======================================================
+# LOAD FREQUENCY
+# ======================================================
+
+AS_freq = [
+    basin_mean(f"{AS}/freq_1993_2003.npy"),
+    basin_mean(f"{AS}/freq_2004_2014.npy"),
+    basin_mean(f"{AS}/freq_2015_2025.npy")
+]
+
+BoB_freq = [
+    basin_mean(f"{BoB}/freq_1993_2003.npy"),
+    basin_mean(f"{BoB}/freq_2004_2014.npy"),
+    basin_mean(f"{BoB}/freq_2015_2025.npy")
+]
+
+# ======================================================
+# LOAD DURATION
+# ======================================================
+
+AS_dur = [
+    basin_mean(f"{AS}/dur_1993_2003.npy"),
+    basin_mean(f"{AS}/dur_2004_2014.npy"),
+    basin_mean(f"{AS}/dur_2015_2025.npy")
+]
+
+BoB_dur = [
+    basin_mean(f"{BoB}/dur_1993_2003.npy"),
+    basin_mean(f"{BoB}/dur_2004_2014.npy"),
+    basin_mean(f"{BoB}/dur_2015_2025.npy")
+]
+
+# ======================================================
+# LOAD CUMULATIVE INTENSITY
+# ======================================================
+
+AS_cum = [
+    basin_mean(f"{AS}/cum_1993_2003.npy"),
+    basin_mean(f"{AS}/cum_2004_2014.npy"),
+    basin_mean(f"{AS}/cum_2015_2025.npy")
+]
+
+BoB_cum = [
+    basin_mean(f"{BoB}/cum_1993_2003.npy"),
+    basin_mean(f"{BoB}/cum_2004_2014.npy"),
+    basin_mean(f"{BoB}/cum_2015_2025.npy")
+]
+
+# ======================================================
+# PERCENTAGE CHANGE
+# ======================================================
+
+AS_EM = [
+    pct_change(AS_freq[0], AS_freq[1]),
+    pct_change(AS_dur[0], AS_dur[1]),
+    pct_change(AS_cum[0], AS_cum[1]),
+]
+
+BoB_EM = [
+    pct_change(BoB_freq[0], BoB_freq[1]),
+    pct_change(BoB_dur[0], BoB_dur[1]),
+    pct_change(BoB_cum[0], BoB_cum[1]),
+]
+
+AS_MR = [
+    pct_change(AS_freq[1], AS_freq[2]),
+    pct_change(AS_dur[1], AS_dur[2]),
+    pct_change(AS_cum[1], AS_cum[2]),
+]
+
+BoB_MR = [
+    pct_change(BoB_freq[1], BoB_freq[2]),
+    pct_change(BoB_dur[1], BoB_dur[2]),
+    pct_change(BoB_cum[1], BoB_cum[2]),
+]
+
+# ======================================================
+# PLOT SETTINGS
+# ======================================================
+
+plt.rcParams.update({
+    "font.size": 11,
+    "axes.titlesize": 12,
+    "axes.labelsize": 11
+})
+
+metrics = ["Frequency", "Duration", "Cumulative Intensity"]
+
+fig, axes = plt.subplots(
+    3, 2,
+    figsize=(12, 10),
+    constrained_layout=True
+)
+
+# ======================================================
+# PLOTTING
+# ======================================================
+
+for i, metric in enumerate(metrics):
+
+    # -----------------------------------
+    # Early → Middle
+    # -----------------------------------
+
+    ax = axes[i, 0]
+
+    vals = [AS_EM[i], BoB_EM[i]]
+
+    bars = ax.bar(
+        ["Arabian Sea", "Bay of Bengal"],
+        vals,
+        color=["red", "blue"],
+        width=0.4
+    )
+
+    ax.axhline(0, color="black", linewidth=1)
+
+    ax.set_title(f"{metric}\nEarly → Middle")
+    ax.set_ylabel("% Change")
+
+    ax.grid(
+        True,
+        axis="y",
+        linestyle="--",
+        alpha=0.4
+    )
+
+    for b in bars:
+
+        h = b.get_height()
+
+        offset = 1 if h >= 0 else -3
+
+        ax.text(
+            b.get_x() + b.get_width()/2,
+            h + offset,
+            f"{h:.1f}%",
+            ha="center",
+            fontsize=9,
+            fontweight="bold"
+        )
+
+    # -----------------------------------
+    # Middle → Recent
+    # -----------------------------------
+
+    ax = axes[i, 1]
+
+    vals = [AS_MR[i], BoB_MR[i]]
+
+    bars = ax.bar(
+        ["Arabian Sea", "Bay of Bengal"],
+        vals,
+        color=["red", "blue"],
+        width=0.4
+    )
+
+    ax.axhline(0, color="black", linewidth=1)
+
+    ax.set_title(f"{metric}\nMiddle → Recent")
+    ax.set_ylabel("% Change")
+
+    ax.grid(
+        True,
+        axis="y",
+        linestyle="--",
+        alpha=0.4
+    )
+
+    for b in bars:
+
+        h = b.get_height()
+
+        offset = 1 if h >= 0 else -3
+
+        ax.text(
+            b.get_x() + b.get_width()/2,
+            h + offset,
+            f"{h:.1f}%",
+            ha="center",
+            fontsize=9,
+            fontweight="bold"
+        )
+
+# ======================================================
+# TITLE
+# ======================================================
+
+fig.suptitle(
+    "Percentage Change in Marine Heatwave Metrics\nArabian Sea vs Bay of Bengal",
+    fontsize=16,
+    fontweight="bold"
+)
+
+# ======================================================
+# SAVE
+# ======================================================
+
+plt.savefig(
+    "AS_BoB_Percentage_Change.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+# ======================================================
+# PRINT VALUES
+# ======================================================
+
+print("\n===== EARLY → MIDDLE (%) =====")
+for m, a, b in zip(metrics, AS_EM, BoB_EM):
+    print(f"{m:20s}  AS={a:7.2f}%   BoB={b:7.2f}%")
+
+print("\n===== MIDDLE → RECENT (%) =====")
+for m, a, b in zip(metrics, AS_MR, BoB_MR):
+    print(f"{m:20s}  AS={a:7.2f}%   BoB={b:7.2f}%")
