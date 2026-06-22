@@ -1,0 +1,273 @@
+
+"""
+=========================================================
+ARABIAN SEA MHW DETECTION, CSV EXPORT & SEASONAL METRICS
+=========================================================
+"""
+from netCDF4 import Dataset, num2date
+import numpy as np
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from scipy.ndimage import gaussian_filter
+import marineHeatWaves as mhw
+import pandas as pd
+import os
+import warnings
+from datetime import date
+
+warnings.filterwarnings("ignore")
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+class Config:
+    OISST_FILE = "File Name"
+    OUTPUT_DIR = "Direction"
+    
+    # Domain,Change accordingly
+    LAT_MIN, LAT_MAX = 5, 27
+    LON_MIN, LON_MAX = 45, 80
+    
+    # Time,Change Accordingly
+    CLIM_START, CLIM_END = 1993, 2022
+    ANALYSIS_START, ANALYSIS_END = 1993, 2025
+    
+    # Hobday Params
+    PCTILE = 90
+    MIN_DURATION = 5
+    WINDOW_HALF_WIDTH = 5
+    SMOOTH_WIDTH = 31
+    MAX_GAP = 2
+    
+    GAUSSIAN_SIGMA = 1
+
+config = Config()
+os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+print("LOADING DATA")
+data = Dataset(config.OISST_FILE)
+sst = np.ma.filled(data.variables['sst'][:], np.nan)
+lat = data.variables['lat'][:]
+lon = data.variables['lon'][:]
+time_var = data.variables['time']
+dates = num2date(time_var[:], units=time_var.units)
+
+# Convert time to ordinal float (Required by marineHeatWaves)
+t = np.array([date(d.year, d.month, d.day).toordinal() for d in dates])
+data.close()
+
+# =========================================================
+# SUBSET DOMAIN
+# =========================================================
+print("SUBSETTING Arabian Sea")
+lat_idx = np.where((lat >= config.LAT_MIN) & (lat <= config.LAT_MAX))[0]
+lon_idx = np.where((lon >= config.LON_MIN) & (lon <= config.LON_MAX))[0]
+
+subset_lat = lat[lat_idx]
+subset_lon = lon[lon_idx]
+sst_as = sst[:, lat_idx, :][:, :, lon_idx]
+
+nlat = len(subset_lat)
+nlon = len(subset_lon)
+analysis_years = config.ANALYSIS_END - config.ANALYSIS_START + 1
+
+# =========================================================
+# INITIALIZE ARRAYS
+# =========================================================
+# 1. Spatial Metrics (for plotting)
+mhw_frequency = np.full((nlat, nlon), np.nan)
+mhw_duration = np.full((nlat, nlon), np.nan)
+mhw_days = np.full((nlat, nlon), np.nan)
+mhw_cumint = np.full((nlat, nlon), np.nan)
+
+# 2. Seasonal 4D Arrays: (Year, Season, Lat, Lon)
+years = np.arange(config.ANALYSIS_START, config.ANALYSIS_END + 1)
+seasons = ['DJF', 'MAM', 'JJAS', 'ON']
+n_years = len(years)
+n_seasons = len(seasons)
+
+seasonal_freq = np.full((n_years, n_seasons, nlat, nlon), np.nan)
+seasonal_dur = np.full((n_years, n_seasons, nlat, nlon), np.nan)
+seasonal_inten = np.full((n_years, n_seasons, nlat, nlon), np.nan)
+
+# 3. CSV Storage
+csv_rows = []
+
+# =========================================================
+# GRID-WISE MHW DETECTION
+# =========================================================
+print("GRID-WISE MHW DETECTION")
+valid_cells = 0
+
+for i in range(nlat):
+    for j in range(nlon):
+        sst_ts = sst_as[:, i, j]
+        if np.all(np.isnan(sst_ts)):
+            continue
+
+        try:
+            mhws, clim = mhw.detect(
+                t, sst_ts,
+                climatologyPeriod=[config.CLIM_START, config.CLIM_END],
+                pctile=config.PCTILE,
+                minDuration=config.MIN_DURATION,
+                windowHalfWidth=config.WINDOW_HALF_WIDTH,
+                smoothPercentile=True,
+                smoothPercentileWidth=config.SMOOTH_WIDTH,
+                joinAcrossGaps=True,
+                maxGap=config.MAX_GAP
+            )
+
+            # CRITICAL FIX: Cast to int to prevent float64 error
+            n_events = int(mhws['n_events']) 
+
+            if n_events > 0:
+                valid_cells += 1
+
+                # --- A. SPATIAL METRICS ---
+                mhw_frequency[i, j] = n_events / analysis_years
+                mhw_duration[i, j] = np.mean(mhws['duration'])
+                mhw_days[i, j] = np.sum(mhws['duration']) / analysis_years
+                mhw_cumint[i, j] = np.sum(mhws['intensity_cumulative']) / analysis_years
+
+                # --- B. CSV EXTRACTION ---
+                for k in range(n_events):
+                    row = {
+                        'lat_idx': i, 'lon_idx': j,
+                        'lat': subset_lat[i], 'lon': subset_lon[j],
+                        'start_date': mhws['date_start'][k].strftime('%Y-%m-%d'),
+                        'end_date': mhws['date_end'][k].strftime('%Y-%m-%d'),
+                        'duration': mhws['duration'][k],
+                        'mean_intensity': mhws['intensity_mean'][k],
+                        'max_intensity': mhws['intensity_max'][k],
+                        'cum_intensity': mhws['intensity_cumulative'][k]
+                    }
+                    csv_rows.append(row)
+
+                # --- C. SEASONAL METRICS ---
+                cell_freq = np.zeros((n_years, n_seasons))
+                cell_dur = np.zeros((n_years, n_seasons))
+                cell_inten = np.zeros((n_years, n_seasons))
+
+                for k in range(n_events):
+                    d_start = mhws['date_start'][k]
+                    yr = d_start.year
+                    mo = d_start.month
+
+                    # Handle Winter (DJF) Year Shift: Dec belongs to next year
+                    if mo == 12:
+                        s_idx, y_idx = 0, (yr - config.ANALYSIS_START + 1)
+                    elif mo in [1, 2]:
+                        s_idx, y_idx = 0, (yr - config.ANALYSIS_START)
+                    elif mo in [3, 4, 5]:
+                        s_idx, y_idx = 1, (yr - config.ANALYSIS_START)
+                    elif mo in [6, 7, 8, 9]:
+                        s_idx, y_idx = 2, (yr - config.ANALYSIS_START)
+                    else: # 10, 11
+                        s_idx, y_idx = 3, (yr - config.ANALYSIS_START)
+
+                    if 0 <= y_idx < n_years:
+                        cell_freq[y_idx, s_idx] += 1
+                        cell_dur[y_idx, s_idx] += mhws['duration'][k]
+                        cell_inten[y_idx, s_idx] += mhws['intensity_mean'][k]
+
+                # Calculate means and store in 4D arrays
+                seasonal_freq[:, :, i, j] = cell_freq
+
+                valid = cell_freq > 0
+
+                tmp_dur = np.full((n_years, n_seasons), np.nan)
+                tmp_inten = np.full((n_years, n_seasons), np.nan)
+
+                tmp_dur[valid] = cell_dur[valid] / cell_freq[valid]
+                tmp_inten[valid] = cell_inten[valid] / cell_freq[valid]
+
+                seasonal_dur[:, :, i, j] = tmp_dur
+                seasonal_inten[:, :, i, j] = tmp_inten
+
+        except Exception as e:
+            print(f"Error at cell {i},{j}: {e}")
+            continue
+
+    if (i + 1) % 10 == 0:
+        print(f"Progress: {i+1}/{nlat} lats")
+
+print(f"\nValid Cells: {valid_cells}")
+print(f"Total Events Found: {len(csv_rows)}")
+
+# =========================================================
+# SAVE OUTPUTS (CSV & NPY)
+# =========================================================
+print("SAVING CSV AND NPY FILES")
+
+# 1. Save CSV
+df_events = pd.DataFrame(csv_rows)
+csv_path = os.path.join(config.OUTPUT_DIR, "AS_LocalMHW_0m_events.csv")
+df_events.to_csv(csv_path, index=False)
+print(f"✓ Saved CSV: {csv_path}")
+
+# 2. Save Seasonal NPY Arrays
+np.save(os.path.join(config.OUTPUT_DIR, 'Seasonal_Frequency_1993_2025.npy'), seasonal_freq)
+np.save(os.path.join(config.OUTPUT_DIR, 'Seasonal_Duration_1993_2025.npy'), seasonal_dur)
+np.save(os.path.join(config.OUTPUT_DIR, 'Seasonal_Intensity_1993_2025.npy'), seasonal_inten)
+print("✓ Saved Seasonal NPY Arrays")
+
+# =========================================================
+# MASKED SMOOTHING & PLOTTING
+# =========================================================
+def smooth_with_mask(data, sigma=1):
+    mask = np.isnan(data)
+    filled = np.where(mask, 0, data)
+    smooth_data = gaussian_filter(filled, sigma=sigma)
+    smooth_mask = gaussian_filter((~mask).astype(float), sigma=sigma)
+    result = np.where(smooth_mask > 1e-6, smooth_data / smooth_mask, np.nan)
+    result[mask] = np.nan
+    return result
+
+smooth_freq = smooth_with_mask(mhw_frequency, sigma=config.GAUSSIAN_SIGMA)
+smooth_dur = smooth_with_mask(mhw_duration, sigma=config.GAUSSIAN_SIGMA)
+smooth_days = smooth_with_mask(mhw_days, sigma=config.GAUSSIAN_SIGMA)
+smooth_cumint = smooth_with_mask(mhw_cumint, sigma=config.GAUSSIAN_SIGMA)
+
+print("PLOTTING.......")
+fig, axes = plt.subplots(2, 2, figsize=(14, 10), subplot_kw={'projection': ccrs.PlateCarree()})
+axes = axes.flatten()
+
+metrics = [
+    (smooth_freq, '(a) Frequency', 'events/year'),
+    (smooth_dur, '(b) Duration', 'days/event'),
+    (smooth_days, '(c) Total Days', 'days/year'),
+    (smooth_cumint, '(d) Cumulative Intensity', '°C·days/year')
+]
+
+for ax, (data_arr, title, label) in zip(axes, metrics):
+    if np.all(np.isnan(data_arr)):
+        continue
+    valid = data_arr[~np.isnan(data_arr)]
+    vmin, vmax = np.nanpercentile(valid, 5), np.nanpercentile(valid, 95)
+    levels = np.linspace(vmin, vmax, 30)
+
+    cf = ax.contourf(subset_lon, subset_lat, data_arr, levels=levels, cmap='YlOrBr', extend='both', transform=ccrs.PlateCarree())
+    ax.set_extent([config.LON_MIN, config.LON_MAX, config.LAT_MIN, config.LAT_MAX])
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+    ax.add_feature(cfeature.LAND, color='lightgray')
+    gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    cbar = fig.colorbar(cf, ax=ax, shrink=0.8)
+    cbar.set_label(label)
+
+plt.suptitle('Arabian Sea Marine Heatwave Metrics (1993–2025)', fontsize=16, fontweight='bold')
+plt.tight_layout()
+
+outfile = os.path.join(config.OUTPUT_DIR, "AS_MHW_Metrics.png")
+plt.savefig(outfile, dpi=300, bbox_inches='tight')
+print(f"Saved Figure: {outfile}")
+plt.show()
+
+print("ANALYSIS COMPLETE")
